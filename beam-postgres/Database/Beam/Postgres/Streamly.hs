@@ -29,7 +29,7 @@ import qualified Streamly.Data.Unfold as UL
 
 
 import           Data.Int (Int64)
-import           Data.Maybe (fromMaybe)
+import           Data.Maybe (fromMaybe, fromJust, isJust)
 #if !MIN_VERSION_base(4, 11, 0)
 import           Data.Semigroup
 #endif
@@ -40,7 +40,7 @@ import qualified Control.Monad.Fail as Fail
 -- * @SELECT@
 
 -- | Run a PostgreSQL @SELECT@ statement in any 'MonadIO'.
-runSelect :: ( IsStream t, MonadAsync m, FromBackendRow Postgres a )
+runSelect :: ( IsStream t, MonadAsync m, Fail.MonadFail m, FromBackendRow Postgres a )
           => Pg.Connection -> SqlSelect Postgres a
           -> t m a
 runSelect conn (SqlSelect (PgSelectSyntax syntax)) =
@@ -58,7 +58,7 @@ runInsert conn (SqlInsert _ (PgInsertSyntax i)) =
 
 -- | Run a PostgreSQL @INSERT ... RETURNING ...@ statement in any 'MonadIO' and
 -- get a 'C.Source' of the newly inserted rows.
-runInsertReturning :: ( IsStream t, MonadAsync m, FromBackendRow Postgres a )
+runInsertReturning :: ( IsStream t, MonadAsync m, Fail.MonadFail m, FromBackendRow Postgres a )
                    => Pg.Connection
                    -> PgInsertReturning a
                    -> t m a
@@ -78,7 +78,7 @@ runUpdate conn (SqlUpdate _ (PgUpdateSyntax i)) =
 
 -- | Run a PostgreSQL @UPDATE ... RETURNING ...@ statement in any 'MonadIO' and
 -- get a 'C.Source' of the newly updated rows.
-runUpdateReturning :: ( IsStream t, MonadAsync m, FromBackendRow Postgres a)
+runUpdateReturning :: ( IsStream t, MonadAsync m, Fail.MonadFail m, FromBackendRow Postgres a)
                    => Pg.Connection
                    -> PgUpdateReturning a
                    -> t m a
@@ -98,7 +98,7 @@ runDelete conn (SqlDelete _ (PgDeleteSyntax d)) =
 
 -- | Run a PostgreSQl @DELETE ... RETURNING ...@ statement in any
 -- 'MonadIO' and get a 'C.Source' of the deleted rows.
-runDeleteReturning :: ( IsStream t, MonadAsync m, FromBackendRow Postgres a )
+runDeleteReturning :: ( IsStream t, MonadAsync m, Fail.MonadFail m, FromBackendRow Postgres a )
                    => Pg.Connection -> PgDeleteReturning a
                    -> t m a
 runDeleteReturning conn (PgDeleteReturning d) =
@@ -114,58 +114,60 @@ executeStatement conn x =
     Pg.execute_ conn (Pg.Query syntax)
 
 
--- bracketIO :: (IsStream t, MonadAsync m, MonadCatch m) => m b -> (b -> m c) -> (b -> t m a) -> t m a
+-- bracketIO :: (IsStream t, MonadAsync m, Fail.MonadFail m, MonadCatch m) => m b -> (b -> m c) -> (b -> t m a) -> t m a
 
-type QueryFold a b = forall m. (MonadAsync m) => FL.Fold m a b
+type QueryFold a b = forall m. (MonadAsync m, Fail.MonadFail m) => FL.Fold m a b
 
 
 
 -- | Runs any query that returns a set of values
 runQueryReturning
-  :: forall t m r. ( IsStream t, MonadAsync m, FromBackendRow Postgres r )
+  :: forall t m r. ( IsStream t, MonadAsync m, Fail.MonadFail m, FromBackendRow Postgres r )
   => Pg.Connection -> PgSyntax
   -> t m r
-runQueryReturning conn x = bracketIO acquireConnection gracefulShutdown (streamResults Nothing)      
+runQueryReturning conn x = bracketIO sendQueryAndEnterSingleRowMode gracefulShutdown (streamResults Nothing)      
   where
-    acquireConnection :: m ()
-    acquireConnection = do
-      success <- liftIO $ do
-        syntax <- pgRenderSyntax conn x
-        Pg.withConnection conn (\conn' -> Pg.sendQuery conn' syntax)
+    sendQueryAndEnterSingleRowMode :: m ()
+    sendQueryAndEnterSingleRowMode = do
+      success <- (\s -> liftIO $ Pg.withConnection conn (flip Pg.sendQuery s))
+                 =<< (liftIO $ pgRenderSyntax conn x)
       if success then do
         singleRowModeSet <- liftIO (Pg.withConnection conn Pg.setSingleRowMode)
-        if not singleRowModeSet
-          then error "Could not enable single row mode"
-          else return ()
+        if not singleRowModeSet then Fail.fail "Could not enable single row mode" else return ()
         else do
         errMsg <- fromMaybe "No libpq error provided" <$> liftIO (Pg.withConnection conn Pg.errorMessage)
-        error (show errMsg)
+        Fail.fail (show errMsg)
     streamResults :: Maybe [Pg.Field] -> () -> t m r
-    streamResults fields _ = do
-      nextRow <- liftIO (Pg.withConnection conn Pg.getResult)
-      case nextRow of
-        Nothing -> S.nil
-        Just row ->
-          liftIO (Pg.resultStatus row) >>=
-          \case
-            Pg.SingleTuple ->
-              do fields' <- liftIO (maybe (getFields row) pure fields)
-                 parsedRow <- liftIO (runPgRowReader conn 0 row fields' fromBackendRow)
-                 case parsedRow of
-                   Left err -> liftIO (bailEarly row ("Could not read row: " <> show err))
-                   Right parsedRow' ->
-                     do S.yield parsedRow'
-                        streamResults (Just fields') ()
-            Pg.TuplesOk -> liftIO (Pg.withConnection conn finishQuery) >> S.nil
-            Pg.EmptyQuery -> error "No query"
-            Pg.CommandOk -> S.nil
-            _ -> do errMsg <- liftIO (Pg.resultErrorMessage row)
-                    error ("Postgres error: " <> show errMsg)
+    streamResults fields _ = S.unfoldrM getNextRow fields
+      where
+        getNextRow :: (Maybe [Pg.Field]) -> m (Maybe (r, Maybe [Pg.Field]))
+        getNextRow fields = (parseNextRow =<< (liftIO $ Pg.withConnection conn Pg.getResult))
+          where
+            parseNextRow :: Maybe (Pg.Result) -> m (Maybe (r, Maybe [Pg.Field]))
+            parseNextRow nextRow = case nextRow of
+              Nothing -> pure Nothing
+              Just row ->
+                liftIO (Pg.resultStatus row) >>=
+                \case
+                  Pg.SingleTuple -> handleSingleTuple row
+                  Pg.TuplesOk -> liftIO (Pg.withConnection conn finishQuery) >> pure Nothing
+                  Pg.EmptyQuery -> Fail.fail "No query"
+                  Pg.CommandOk -> pure Nothing
+                  _ -> do errMsg <- liftIO (Pg.resultErrorMessage row)
+                          Fail.fail ("Postgres error: " <> show errMsg)
+              where
+                handleSingleTuple :: (Pg.Result) -> m (Maybe (r, Maybe [Pg.Field]))
+                handleSingleTuple row = do
+                    fields' <- liftIO (maybe (getFields row) pure fields)
+                    parsedRow <- liftIO (runPgRowReader conn 0 row fields' fromBackendRow)
+                    case parsedRow of
+                      Left err -> liftIO (bailEarly row ("Could not read row: " <> show err))
+                      Right parsedRow' ->  pure $ Just (parsedRow', Just fields')
 
     bailEarly row errorString = do
       Pg.unsafeFreeResult row
       Pg.withConnection conn $ cancelQuery
-      error errorString
+      Fail.fail errorString
 
     cancelQuery conn' = do
       cancel <- Pg.getCancel conn'
@@ -175,13 +177,11 @@ runQueryReturning conn x = bracketIO acquireConnection gracefulShutdown (streamR
           res <- Pg.cancel cancel'
           case res of
             Right () -> liftIO (finishQuery conn')
-            Left err -> error ("Could not cancel: " <> show err)
+            Left err -> Fail.fail ("Could not cancel: " <> show err)
 
-    finishQuery conn' = do
-      nextRow <- Pg.getResult conn'
-      case nextRow of
-        Nothing -> pure ()
-        Just _ -> finishQuery conn'
+    finishQuery conn' = S.drain $
+                        S.takeWhile (isJust) $
+                        S.repeatM (Pg.getResult conn')
         
     gracefulShutdown :: () -> m ()
     gracefulShutdown _ =
