@@ -125,7 +125,7 @@ runQueryReturning
   :: forall t m r. ( IsStream t, MonadAsync m, Fail.MonadFail m, FromBackendRow Postgres r )
   => Pg.Connection -> PgSyntax
   -> t m r
-runQueryReturning conn x = bracketIO sendQueryAndEnterSingleRowMode gracefulShutdown (streamResults Nothing)      
+runQueryReturning conn x = gracefulShutdown `S.after` (sendQueryAndEnterSingleRowMode `S.before` (streamResults Nothing))      
   where
     sendQueryAndEnterSingleRowMode :: m ()
     sendQueryAndEnterSingleRowMode = do
@@ -137,8 +137,8 @@ runQueryReturning conn x = bracketIO sendQueryAndEnterSingleRowMode gracefulShut
         else do
         errMsg <- fromMaybe "No libpq error provided" <$> liftIO (Pg.withConnection conn Pg.errorMessage)
         Fail.fail (show errMsg)
-    streamResults :: Maybe [Pg.Field] -> () -> t m r
-    streamResults fields _ = S.unfoldrM getNextRow fields
+    streamResults :: Maybe [Pg.Field] -> t m r
+    streamResults fields = S.unfoldrM getNextRow fields
       where
         getNextRow :: (Maybe [Pg.Field]) -> m (Maybe (r, Maybe [Pg.Field]))
         getNextRow fields = (parseNextRow =<< (liftIO $ Pg.withConnection conn Pg.getResult))
@@ -183,8 +183,8 @@ runQueryReturning conn x = bracketIO sendQueryAndEnterSingleRowMode gracefulShut
                         S.takeWhile (isJust) $
                         S.repeatM (Pg.getResult conn')
         
-    gracefulShutdown :: () -> m ()
-    gracefulShutdown _ =
+    gracefulShutdown :: m ()
+    gracefulShutdown =
       liftIO . Pg.withConnection conn $ \conn' ->
       do sts <- Pg.transactionStatus conn'
          case sts of
